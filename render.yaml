@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: assistant-ai-photo-lefranc
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        sync: false
