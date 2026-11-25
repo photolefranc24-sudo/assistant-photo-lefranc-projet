@@ -5,7 +5,7 @@ const PORT = process.env.PORT || 3000;
 const BASE = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
 const TIMEOUT = Number(process.env.REQUEST_TIMEOUT_MS) || 25000;
 const SYSTEM = `Tu es l’Assistant AI PHOTO LEFRANC, conseiller spécialisé en photographie d’identité et de visa. Réponds en français, de façon chaleureuse, patiente, simple et concise, avec des étapes courtes.
-Règles : ne juge jamais l’apparence physique. N’invente jamais une dimension, une norme officielle ou une exigence de visa : si tu n’es pas sûr, dis qu’une vérification auprès de l’autorité concernée est nécessaire. Ne prétends jamais qu’une photo est officiellement acceptée. Tu ne peux pas encore analyser les images : si une photo est mentionnée, explique-le et donne des conseils généraux (lumière, netteté, cadrage, fond, position du visage). Ne prétends jamais avoir modifié, sauvegardé ou transféré un fichier. Le traitement final, les planches, les paiements et les téléchargements relèvent de l’application PHOTO LEFRANC.`;
+Règles : ne juge jamais l’apparence physique. N’invente jamais une dimension, une norme officielle ou une exigence de visa : si tu n’es pas sûr, dis qu’une vérification auprès de l’autorité concernée est nécessaire. Ne prétends jamais qu’une photo est officiellement acceptée. Tu peux analyser une image envoyée pour donner des observations visuelles prudentes sur la lumière, la netteté, le cadrage, le fond et la position du visage. Ne tente jamais d’identifier la personne ni de déduire son identité, son origine ou ses caractéristiques sensibles. Ne prétends jamais avoir modifié, sauvegardé ou transféré un fichier. Le traitement final, les planches, les paiements et les téléchargements relèvent de l’application PHOTO LEFRANC.`;
 const hits = new Map();
 const limited = ip => { const t = Date.now(), a = (hits.get(ip) || []).filter(x => t - x < 60000); a.push(t); hits.set(ip, a); return a.length > 20; };
 const send = (res, code, obj) => { res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" }); res.end(JSON.stringify(obj)); };
@@ -43,10 +43,41 @@ async function chat(req, res) {
     send(res, e.name === "AbortError" ? 504 : 502, { error: e.name === "AbortError" ? "Délai dépassé." : "Fournisseur IA injoignable." });
   } finally { clearTimeout(timer); }
 }
+
+async function analyzeImage(req, res) {
+  const expected = process.env.PHOTO_LEFRANC_SHARED_SECRET;
+  const supplied = req.headers.authorization || "";
+  if (!expected || supplied !== "Bearer " + expected) return send(res, 401, { error: "Non autorisé." });
+  if (!process.env.OPENAI_API_KEY || !process.env.OPENAI_MODEL) return send(res, 503, { error: "Assistant non configuré." });
+  let raw = "", tooBig = false;
+  for await (const c of req) { raw += c; if (raw.length > 7_000_000) { tooBig = true; break; } }
+  let body; try { body = tooBig ? null : JSON.parse(raw); } catch { body = null; }
+  const image = body && body.image;
+  const prompt = body && typeof body.prompt === "string" ? body.prompt.slice(0, 4000) : "Analyse cette photo d'identité avec prudence.";
+  if (typeof image !== "string" || !/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(image) || image.length > 6_500_000) return send(res, 400, { error: "Image invalide ou trop volumineuse." });
+  const ac = new AbortController(), timer = setTimeout(() => ac.abort(), TIMEOUT);
+  try {
+    const r = await fetch(BASE + "/chat/completions", {
+      method: "POST", signal: ac.signal,
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + process.env.OPENAI_API_KEY },
+      body: JSON.stringify({ model: process.env.OPENAI_MODEL, messages: [
+        { role: "system", content: SYSTEM },
+        { role: "user", content: [ { type: "text", text: prompt }, { type: "image_url", image_url: { url: image, detail: "high" } } ] }
+      ] })
+    });
+    if (!r.ok) { const detail = await r.text().catch(() => ""); console.error("OpenAI image HTTP", r.status, detail.slice(0, 500)); return send(res, 502, { error: "Le modèle IA n'a pas pu analyser cette image. Vérifiez que OPENAI_MODEL accepte les images." }); }
+    const reply = (await r.json())?.choices?.[0]?.message?.content;
+    if (!reply) return send(res, 502, { error: "Réponse IA vide." });
+    send(res, 200, { reply });
+  } catch (e) { console.error("Analyse image échouée :", e.name); send(res, e.name === "AbortError" ? 504 : 502, { error: e.name === "AbortError" ? "Délai dépassé." : "Fournisseur IA injoignable." }); }
+  finally { clearTimeout(timer); }
+}
+
 const page = path.join(__dirname, "public", "index.html");
 http.createServer((req, res) => {
   const u = req.url.split("?")[0];
   if (req.method === "POST" && u === "/api/chat") return chat(req, res).catch(() => send(res, 500, { error: "Erreur serveur." }));
+  if (req.method === "POST" && u === "/api/analyze-image") return analyzeImage(req, res).catch(() => send(res, 500, { error: "Erreur serveur." }));
   if (req.method === "GET" && u === "/health") return send(res, 200, { ok: true });
   if (req.method === "GET" && (u === "/" || u === "/index.html")) {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "X-Content-Type-Options": "nosniff" });
